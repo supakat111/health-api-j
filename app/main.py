@@ -18,6 +18,7 @@ from app.extract import extract_from_file, _is_pdf
 from app.db import upload_pdf, save_report
 from app.resolve import (
     resolve_results, load_canonical_tests, create_canonical, add_alias,
+    suggest_mappings,
 )
 
 
@@ -65,11 +66,14 @@ async def extract(
         resolved = resolve_results(data.get("results", []))
         data["results"] = resolved["results"]
         data["unmapped"] = resolved["unmapped"]
-        data["canonical_tests"] = load_canonical_tests()
+        cts = load_canonical_tests()
+        data["canonical_tests"] = cts
+        # AI-suggested mappings for the unmapped names (optional, best-effort).
+        data["suggestions"] = suggest_mappings(resolved["unmapped"], cts)
     except Exception as e:
-        # Resolution is non-fatal; surface values even if mapping lookup fails.
         data["unmapped"] = []
         data["canonical_tests"] = []
+        data["suggestions"] = {}
         data["resolve_error"] = str(e)
 
     return JSONResponse(data)
@@ -222,6 +226,7 @@ PAGE = """<!doctype html>
 let lastResults = [];
 let canonicalTests = [];
 let unmapped = [];
+let suggestions = {};
 let lastFile = null;
 const $ = s => document.querySelector(s);
 
@@ -240,6 +245,7 @@ $("#extractBtn").onclick = async () => {
     lastResults = data.results || [];
     canonicalTests = data.canonical_tests || [];
     unmapped = data.unmapped || [];
+    suggestions = data.suggestions || {};
     $("#reportDate").value = data.report_date || "";
     $("#labName").value = data.lab_name || "";
     renderMapPanel();
@@ -256,7 +262,7 @@ function canonOptions(selected) {
   canonicalTests.forEach(c => {
     opts += `<option value="${c.id}" ${selected===c.id?"selected":""}>${esc(c.display_name)}</option>`;
   });
-  opts += '<option value="__new__">+ It\\'s a new test</option>';
+  opts += `<option value="__new__" ${selected==='__new__'?"selected":""}>+ It\\'s a new test</option>`;
   return opts;
 }
 
@@ -265,12 +271,27 @@ function renderMapPanel() {
   $("#mapCard").style.display = "block";
   const tb = $("#mapTbl tbody"); tb.innerHTML = "";
   unmapped.forEach((name, i) => {
+    const sug = suggestions[name] || {};
+    // Pre-select: high-confidence existing match -> that test;
+    // suggested new -> "__new__"; otherwise leave blank for human attention.
+    let preselect = "";
+    if (sug.canonical_id && sug.confidence === "high") preselect = sug.canonical_id;
+    else if (sug.is_new) preselect = "__new__";
+
+    const conf = sug.canonical_id
+      ? `<span class="muted">AI: ${esc(sug.canonical_name)} (${sug.confidence})</span>`
+      : (sug.is_new ? `<span class="muted">AI: looks new</span>` : `<span class="muted">AI: unsure</span>`);
+
+    const newName = sug.is_new ? name : name;
+    const newUnit = sug.suggested_unit || "";
+    const newDisabled = preselect === "__new__" ? "" : "disabled";
+
     const tr = document.createElement("tr");
     tr.innerHTML =
-      `<td>${esc(name)}</td>`+
-      `<td><select data-i="${i}" class="mapSel">${canonOptions("")}</select></td>`+
-      `<td><input data-i="${i}" class="mapNew" placeholder="clean name" value="${esc(name)}" disabled/></td>`+
-      `<td><input data-i="${i}" class="mapUnit" placeholder="unit" disabled/></td>`;
+      `<td>${esc(name)}<br>${conf}</td>`+
+      `<td><select data-i="${i}" class="mapSel">${canonOptions(preselect)}</select></td>`+
+      `<td><input data-i="${i}" class="mapNew" placeholder="clean name" value="${esc(newName)}" ${newDisabled}/></td>`+
+      `<td><input data-i="${i}" class="mapUnit" placeholder="unit" value="${esc(newUnit)}" ${newDisabled}/></td>`;
     tb.appendChild(tr);
   });
   tb.querySelectorAll(".mapSel").forEach(sel => {
@@ -313,6 +334,7 @@ $("#applyMapBtn").onclick = async () => {
     lastResults = data.results || [];
     canonicalTests = data.canonical_tests || [];
     unmapped = data.unmapped || [];
+    suggestions = data.suggestions || {};
     renderMapPanel();
     renderTable();
     $("#mapStatus").textContent = unmapped.length ? (unmapped.length + " still unmapped.") : "All tests mapped.";

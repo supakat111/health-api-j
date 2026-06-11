@@ -131,3 +131,74 @@ def add_alias(raw_name: str, canonical_id: str):
         {"alias_name": norm, "canonical_id": canonical_id},
         on_conflict="alias_name",
     ).execute()
+
+
+def suggest_mappings(unmapped_names: list, canonical_tests: list) -> dict:
+    """Ask Claude to match each unmapped lab name to an existing canonical test,
+    or to mark it as genuinely new. Returns best-guesses with confidence.
+
+    SAFETY: this only proposes a mapping to a test that already exists in the
+    user's canonical list (by exact display_name), or "new". It never merges
+    anything on its own — it only pre-fills a dropdown the user still confirms.
+
+    Returns: { raw_name: {"canonical_name": str|None, "confidence": "high|low",
+                          "is_new": bool, "suggested_unit": str|None} }
+    """
+    if not unmapped_names:
+        return {}
+
+    # Lazy import so the module loads even if anthropic isn't needed.
+    from anthropic import Anthropic
+    client = Anthropic(api_key=settings.anthropic_api_key)
+
+    existing = [c["display_name"] for c in canonical_tests]
+
+    import json as _json
+    prompt = (
+        "You match laboratory test names to a known list. For each input name, "
+        "decide if it refers to the SAME analyte as one of the existing tests, "
+        "or is genuinely new.\n\n"
+        f"EXISTING tests (match only to these exact names): {_json.dumps(existing)}\n\n"
+        f"INPUT names to classify: {_json.dumps(unmapped_names)}\n\n"
+        "Return ONLY a JSON object mapping each input name to:\n"
+        '  {"match": "<exact existing name>" or null,\n'
+        '   "confidence": "high" or "low",\n'
+        '   "is_new": true/false,\n'
+        '   "suggested_unit": "<typical unit>" or null}\n\n'
+        "Rules:\n"
+        "- Only use 'high' confidence when you are quite sure it's the same analyte.\n"
+        "- Be careful with similar-but-different tests (free vs total, D2 vs D3, "
+        "direct vs indirect) — if unsure whether they are the same, use 'low' "
+        "confidence and match=null.\n"
+        "- If no existing test fits, set match=null and is_new=true.\n"
+        "- Output the JSON object and nothing else."
+    )
+
+    try:
+        msg = client.messages.create(
+            model=settings.model,
+            max_tokens=2048,
+            messages=[
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": "{"},
+            ],
+        )
+        raw = "".join(b.text for b in msg.content if b.type == "text")
+        parsed = _json.loads("{" + raw)
+    except Exception:
+        return {}  # suggestions are optional; fall back to blank dropdowns
+
+    # Resolve matched display_name back to its canonical_id for the UI.
+    name_to_id = {c["display_name"]: c["id"] for c in canonical_tests}
+    out = {}
+    for raw_name in unmapped_names:
+        s = parsed.get(raw_name) or {}
+        match = s.get("match")
+        out[raw_name] = {
+            "canonical_name": match if match in name_to_id else None,
+            "canonical_id": name_to_id.get(match),
+            "confidence": "high" if s.get("confidence") == "high" and match in name_to_id else "low",
+            "is_new": bool(s.get("is_new")) and not match,
+            "suggested_unit": s.get("suggested_unit"),
+        }
+    return out
