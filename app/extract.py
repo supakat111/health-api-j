@@ -76,32 +76,91 @@ def extract_from_file(file_bytes: bytes, media_type: str) -> dict:
 
     msg = client.messages.create(
         model=settings.model,
-        max_tokens=4096,
-        messages=[{
-            "role": "user",
-            "content": [source_block, {"type": "text", "text": EXTRACTION_PROMPT}],
-        }],
+        max_tokens=16384,  # large reports have many values; avoid truncation
+        messages=[
+            {
+                "role": "user",
+                "content": [source_block, {"type": "text", "text": EXTRACTION_PROMPT}],
+            },
+            # Prefill the assistant turn with an opening brace so the model is
+            # constrained to emit JSON (no prose, no code fences) from the start.
+            {"role": "assistant", "content": "{"},
+        ],
     )
 
-    text = "".join(block.text for block in msg.content if block.type == "text").strip()
+    raw = "".join(block.text for block in msg.content if block.type == "text")
+    # We prefilled "{", so prepend it back to reconstruct the full JSON object.
+    text = "{" + raw
+    text = text.strip()
 
-    # Be tolerant if the model wraps the JSON in code fences despite instructions.
+    # Strip code fences just in case the model added them despite the prefill.
     if text.startswith("```"):
         text = text.strip("`")
         if text.lstrip().lower().startswith("json"):
             text = text.lstrip()[4:]
-    text = text.strip()
+        text = text.strip()
 
+    data = _parse_json_tolerant(text)
+    truncated = msg.stop_reason == "max_tokens"
+    return _apply_flags(data, truncated=truncated)
+
+
+def _parse_json_tolerant(text: str) -> dict:
+    """Parse JSON, and if it was cut off mid-stream, salvage the complete
+    results that did come through rather than failing the whole extraction."""
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Could not parse extraction output as JSON: {e}")
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
 
-    return _apply_flags(data)
+    # Salvage path: pull out whatever complete {...} result objects exist inside
+    # the "results" array, even if the array/object was never closed.
+    import re
+    results = []
+    # Find the results array start, then scan balanced-brace objects after it.
+    start = text.find('"results"')
+    if start != -1:
+        i = text.find("[", start)
+        if i != -1:
+            depth = 0
+            obj_start = None
+            for j in range(i + 1, len(text)):
+                c = text[j]
+                if c == "{":
+                    if depth == 0:
+                        obj_start = j
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0 and obj_start is not None:
+                        chunk = text[obj_start:j + 1]
+                        try:
+                            results.append(json.loads(chunk))
+                        except json.JSONDecodeError:
+                            pass
+                        obj_start = None
+
+    # Try to recover report_date / lab_name from the header portion.
+    def _grab(field):
+        m = re.search(r'"%s"\s*:\s*"([^"]*)"' % field, text)
+        return m.group(1) if m else None
+
+    if results:
+        return {
+            "report_date": _grab("report_date"),
+            "lab_name": _grab("lab_name"),
+            "results": results,
+        }
+
+    raise ValueError(
+        "Could not parse extraction output as JSON (and no complete values "
+        "could be salvaged). The report may be unusually long or low-quality."
+    )
 
 
-def _apply_flags(data: dict) -> dict:
+def _apply_flags(data: dict, truncated: bool = False) -> dict:
     """Compute out_of_range and needs_review for each result."""
+    data["truncated"] = truncated
     for r in data.get("results", []):
         v = r.get("value_num")
         lo = r.get("ref_low")
