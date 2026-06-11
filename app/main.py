@@ -15,8 +15,9 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.config import settings
 from app.extract import extract_from_file, _is_pdf
-from app.db import upload_pdf, save_report, fetch_daily_entries, fetch_lab_series
+from app.db import upload_pdf, save_report, fetch_daily_entries, fetch_lab_series, lab_surveillance
 from app.cycles import load_cycle_starts, cycle_info
+from app.hub import HUB_PAGE
 from app.resolve import (
     resolve_results, load_canonical_tests, create_canonical, add_alias,
     suggest_mappings,
@@ -33,6 +34,11 @@ def _check_auth(password: str | None):
         raise HTTPException(500, "Server missing APP_PASSWORD configuration.")
     if password != settings.app_password:
         raise HTTPException(401, "Wrong or missing password.")
+
+
+@app.get("/app", response_class=HTMLResponse)
+def hub():
+    return HUB_PAGE
 
 
 @app.get("/healthz")
@@ -128,6 +134,12 @@ async def add_canonical(
         raise HTTPException(500, f"Saving canonical/alias failed: {e}")
 
     return {"status": "ok", "canonical_id": cid}
+
+
+@app.get("/surveillance")
+def surveillance(x_app_password: str | None = Header(default=None)):
+    _check_auth(x_app_password)
+    return lab_surveillance(borderline_pct=0.10)
 
 
 @app.get("/chartdata")

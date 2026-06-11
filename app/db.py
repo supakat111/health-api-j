@@ -118,3 +118,78 @@ def fetch_lab_series() -> dict:
     for s in series.values():
         s["points"].sort(key=lambda p: p.get("date") or "")
     return series
+
+
+# ── Lab surveillance: what's off, borderline, or changed ─────────────────────
+
+def lab_surveillance(borderline_pct: float = 0.10) -> dict:
+    """For each canonical (or raw) lab marker, look at its most recent value and
+    classify it. Borderline = within `borderline_pct` of either reference edge.
+    Also report the change from the previous draw when available.
+
+    Returns:
+      { "markers": [ { name, unit, latest_value, latest_date, ref_low, ref_high,
+                       status: 'high'|'low'|'borderline_high'|'borderline_low'|'normal'|'unknown',
+                       prev_value, prev_date, delta, direction } ],
+        "counts": {high, low, borderline, normal, unknown} }
+    """
+    series = fetch_lab_series()
+    markers = []
+    counts = {"high": 0, "low": 0, "borderline": 0, "normal": 0, "unknown": 0}
+
+    for name, s in series.items():
+        pts = [p for p in s["points"] if p.get("value") is not None]
+        if not pts:
+            continue
+        pts.sort(key=lambda p: p.get("date") or "")
+        latest = pts[-1]
+        prev = pts[-2] if len(pts) >= 2 else None
+        lo, hi = s.get("ref_low"), s.get("ref_high")
+        v = latest["value"]
+
+        status = "unknown"
+        if isinstance(lo, (int, float)) or isinstance(hi, (int, float)):
+            status = "normal"
+            if isinstance(hi, (int, float)) and v > hi:
+                status = "high"
+            elif isinstance(lo, (int, float)) and v < lo:
+                status = "low"
+            else:
+                # within range — check borderline against whichever edges exist
+                if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+                    band = (hi - lo) * borderline_pct
+                    if v <= lo + band:
+                        status = "borderline_low"
+                    elif v >= hi - band:
+                        status = "borderline_high"
+
+        if status in ("high",):
+            counts["high"] += 1
+        elif status in ("low",):
+            counts["low"] += 1
+        elif status in ("borderline_low", "borderline_high"):
+            counts["borderline"] += 1
+        elif status == "normal":
+            counts["normal"] += 1
+        else:
+            counts["unknown"] += 1
+
+        delta = direction = None
+        if prev and isinstance(prev.get("value"), (int, float)):
+            delta = round(v - prev["value"], 4)
+            direction = "up" if delta > 0 else ("down" if delta < 0 else "flat")
+
+        markers.append({
+            "name": name, "unit": s.get("unit"),
+            "latest_value": v, "latest_date": latest.get("date"),
+            "ref_low": lo, "ref_high": hi, "status": status,
+            "prev_value": prev["value"] if prev else None,
+            "prev_date": prev.get("date") if prev else None,
+            "delta": delta, "direction": direction,
+            "n_points": len(pts),
+        })
+
+    # sort so attention-worthy items float to top
+    rank = {"high":0,"low":0,"borderline_high":1,"borderline_low":1,"normal":2,"unknown":3}
+    markers.sort(key=lambda m: (rank.get(m["status"],3), m["name"].lower()))
+    return {"markers": markers, "counts": counts}
