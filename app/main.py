@@ -16,6 +16,9 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from app.config import settings
 from app.extract import extract_from_file, _is_pdf
 from app.db import upload_pdf, save_report
+from app.resolve import (
+    resolve_results, load_canonical_tests, create_canonical, add_alias,
+)
 
 
 app = FastAPI(title="Health API J")
@@ -57,7 +60,69 @@ async def extract(
     except Exception as e:
         raise HTTPException(500, f"Unexpected extraction error: {e}")
 
+    # Map each value to a canonical test (or mark as needing a mapping decision).
+    try:
+        resolved = resolve_results(data.get("results", []))
+        data["results"] = resolved["results"]
+        data["unmapped"] = resolved["unmapped"]
+        data["canonical_tests"] = load_canonical_tests()
+    except Exception as e:
+        # Resolution is non-fatal; surface values even if mapping lookup fails.
+        data["unmapped"] = []
+        data["canonical_tests"] = []
+        data["resolve_error"] = str(e)
+
     return JSONResponse(data)
+
+
+@app.get("/canonical")
+def list_canonical(x_app_password: str | None = Header(default=None)):
+    _check_auth(x_app_password)
+    return {"canonical_tests": load_canonical_tests()}
+
+
+@app.post("/canonical")
+async def add_canonical(
+    payload: str = Form(...),
+    x_app_password: str | None = Header(default=None),
+):
+    """Create a new canonical test and/or map raw names to it.
+
+    payload JSON:
+      {
+        "display_name": "Ferritin",          # required if creating new
+        "canonical_id": "uuid-or-null",      # set to map to an existing one instead
+        "canonical_unit": "ng/mL",           # optional
+        "aliases": ["FERRITIN", "Ferritin, Serum"]   # raw names to map
+      }
+    """
+    _check_auth(x_app_password)
+    import json
+    try:
+        p = json.loads(payload)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "payload is not valid JSON.")
+
+    cid = p.get("canonical_id")
+    try:
+        if not cid:
+            if not p.get("display_name"):
+                raise HTTPException(400, "Need display_name to create a canonical test.")
+            cid = create_canonical(
+                display_name=p["display_name"],
+                canonical_unit=p.get("canonical_unit"),
+                ref_low=p.get("ref_low"),
+                ref_high=p.get("ref_high"),
+                category=p.get("category"),
+            )
+        for alias in p.get("aliases", []):
+            add_alias(alias, cid)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Saving canonical/alias failed: {e}")
+
+    return {"status": "ok", "canonical_id": cid}
 
 
 @app.post("/save")
@@ -131,13 +196,23 @@ PAGE = """<!doctype html>
   <div id="status"></div>
 </div>
 
+<div class="card" id="mapCard" style="display:none">
+  <h2 style="font-size:16px; margin-top:0">New tests to map</h2>
+  <p class="muted">These names haven't been seen before. For each one, pick an existing test it matches, or mark it as new. This is remembered so the same lab maps automatically next time.</p>
+  <table id="mapTbl"><thead><tr>
+    <th>Lab printed</th><th>Map to</th><th>If new: clean name</th><th>Unit</th>
+  </tr></thead><tbody></tbody></table>
+  <p style="margin-top:12px"><button id="applyMapBtn">Save mappings</button></p>
+  <div id="mapStatus" class="muted"></div>
+</div>
+
 <div class="card" id="resultCard" style="display:none">
   <div style="display:flex; gap:16px; flex-wrap:wrap; margin-bottom:12px">
     <label>Report date <input type="text" id="reportDate" placeholder="YYYY-MM-DD"/></label>
     <label>Lab <input type="text" id="labName" placeholder="lab name"/></label>
   </div>
   <table id="tbl"><thead><tr>
-    <th>Test</th><th>Value</th><th>Unit</th><th>Ref low</th><th>Ref high</th><th>Flags</th>
+    <th>Test</th><th>Maps to</th><th>Value</th><th>Unit</th><th>Ref low</th><th>Ref high</th><th>Flags</th>
   </tr></thead><tbody></tbody></table>
   <p style="margin-top:14px"><button id="saveBtn">Save to database</button></p>
   <div id="saveStatus" class="muted"></div>
@@ -145,6 +220,9 @@ PAGE = """<!doctype html>
 
 <script>
 let lastResults = [];
+let canonicalTests = [];
+let unmapped = [];
+let lastFile = null;
 const $ = s => document.querySelector(s);
 
 $("#extractBtn").onclick = async () => {
@@ -152,6 +230,7 @@ $("#extractBtn").onclick = async () => {
   const f = $("#file").files[0];
   if (!pw) { $("#status").textContent = "Enter the password first."; return; }
   if (!f) { $("#status").textContent = "Choose a file first."; return; }
+  lastFile = f;
   $("#status").textContent = "Extracting… (this takes a few seconds)";
   const fd = new FormData(); fd.append("file", f);
   try {
@@ -159,12 +238,85 @@ $("#extractBtn").onclick = async () => {
     if (!res.ok) { $("#status").textContent = "Error: " + (await res.text()); return; }
     const data = await res.json();
     lastResults = data.results || [];
+    canonicalTests = data.canonical_tests || [];
+    unmapped = data.unmapped || [];
     $("#reportDate").value = data.report_date || "";
     $("#labName").value = data.lab_name || "";
+    renderMapPanel();
     renderTable();
     $("#resultCard").style.display = "block";
-    $("#status").textContent = "Found " + lastResults.length + " values. Review and save.";
+    let msg = "Found " + lastResults.length + " values.";
+    if (unmapped.length) msg += " " + unmapped.length + " new test name(s) to map first.";
+    $("#status").textContent = msg;
   } catch (e) { $("#status").textContent = "Request failed: " + e; }
+};
+
+function canonOptions(selected) {
+  let opts = '<option value="">— map to —</option>';
+  canonicalTests.forEach(c => {
+    opts += `<option value="${c.id}" ${selected===c.id?"selected":""}>${esc(c.display_name)}</option>`;
+  });
+  opts += '<option value="__new__">+ It\\'s a new test</option>';
+  return opts;
+}
+
+function renderMapPanel() {
+  if (!unmapped.length) { $("#mapCard").style.display = "none"; return; }
+  $("#mapCard").style.display = "block";
+  const tb = $("#mapTbl tbody"); tb.innerHTML = "";
+  unmapped.forEach((name, i) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      `<td>${esc(name)}</td>`+
+      `<td><select data-i="${i}" class="mapSel">${canonOptions("")}</select></td>`+
+      `<td><input data-i="${i}" class="mapNew" placeholder="clean name" value="${esc(name)}" disabled/></td>`+
+      `<td><input data-i="${i}" class="mapUnit" placeholder="unit" disabled/></td>`;
+    tb.appendChild(tr);
+  });
+  tb.querySelectorAll(".mapSel").forEach(sel => {
+    sel.onchange = () => {
+      const i = sel.dataset.i;
+      const isNew = sel.value === "__new__";
+      tb.querySelector(`.mapNew[data-i="${i}"]`).disabled = !isNew;
+      tb.querySelector(`.mapUnit[data-i="${i}"]`).disabled = !isNew;
+    };
+  });
+}
+
+$("#applyMapBtn").onclick = async () => {
+  const pw = $("#pw").value;
+  const tb = $("#mapTbl tbody");
+  const rows = [...tb.querySelectorAll("tr")];
+  $("#mapStatus").textContent = "Saving mappings…";
+  try {
+    for (let i = 0; i < rows.length; i++) {
+      const sel = tb.querySelector(`.mapSel[data-i="${i}"]`);
+      const rawName = unmapped[i];
+      if (!sel.value) continue; // skipped
+      let payload;
+      if (sel.value === "__new__") {
+        const clean = tb.querySelector(`.mapNew[data-i="${i}"]`).value.trim() || rawName;
+        const unit = tb.querySelector(`.mapUnit[data-i="${i}"]`).value.trim() || null;
+        payload = JSON.stringify({ display_name: clean, canonical_unit: unit, aliases: [rawName] });
+      } else {
+        payload = JSON.stringify({ canonical_id: sel.value, aliases: [rawName] });
+      }
+      const fd = new FormData(); fd.append("payload", payload);
+      const res = await fetch("/canonical", { method:"POST", headers:{ "x-app-password": pw }, body: fd });
+      if (!res.ok) { $("#mapStatus").textContent = "Error on '" + rawName + "': " + (await res.text()); return; }
+    }
+    // Re-extract to re-resolve with the new mappings applied.
+    $("#mapStatus").textContent = "Mappings saved. Refreshing values…";
+    const fd = new FormData(); fd.append("file", lastFile);
+    const res = await fetch("/extract", { method:"POST", headers:{ "x-app-password": pw }, body: fd });
+    const data = await res.json();
+    lastResults = data.results || [];
+    canonicalTests = data.canonical_tests || [];
+    unmapped = data.unmapped || [];
+    renderMapPanel();
+    renderTable();
+    $("#mapStatus").textContent = unmapped.length ? (unmapped.length + " still unmapped.") : "All tests mapped.";
+  } catch (e) { $("#mapStatus").textContent = "Failed: " + e; }
 };
 
 function renderTable() {
@@ -175,11 +327,12 @@ function renderTable() {
     else if (r.needs_review) tr.className = "review";
     tr.innerHTML =
       `<td><input value="${esc(r.test_name||"")}" data-i="${i}" data-k="test_name"/></td>`+
+      `<td class="muted">${r.canonical_name?esc(r.canonical_name):'<span style="color:#c4934a">unmapped</span>'}</td>`+
       `<td><input value="${esc(r.value_text!=null?r.value_text:(r.value_num!=null?r.value_num:""))}" data-i="${i}" data-k="value_text"/></td>`+
       `<td><input value="${esc(r.unit||"")}" data-i="${i}" data-k="unit"/></td>`+
       `<td><input value="${r.ref_low!=null?r.ref_low:""}" data-i="${i}" data-k="ref_low"/></td>`+
       `<td><input value="${r.ref_high!=null?r.ref_high:""}" data-i="${i}" data-k="ref_high"/></td>`+
-      `<td>${r.out_of_range?'<span class="flag oor">out of range</span>':''}${r.needs_review?' <span class="flag review">review</span>':''}</td>`;
+      `<td>${r.out_of_range?'<span class="flag oor">out of range</span>':''}${r.needs_review?' <span class="flag review">review</span>':''}${r.unit_flag==='unit_mismatch'?' <span class="flag review">unit?</span>':''}${r.unit_flag==='converted'?' <span class="flag" style="background:#dce9e0;color:#3a6a4a">unit ok</span>':''}</td>`;
     tb.appendChild(tr);
   });
   tb.querySelectorAll("input").forEach(inp => {

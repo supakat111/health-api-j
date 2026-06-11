@@ -52,6 +52,10 @@ def save_report(report_date, lab_name, file_path, file_name, results: list) -> s
             "ref_text": r.get("ref_text"),
             "out_of_range": bool(r.get("out_of_range")),
             "needs_review": bool(r.get("needs_review")),
+            "canonical_id": r.get("canonical_id"),
+            "raw_test_name": r.get("raw_test_name") or r.get("test_name"),
+            "raw_unit": r.get("raw_unit") or r.get("unit"),
+            "unit_flag": r.get("unit_flag"),
         })
     if rows:
         sb.table("lab_results").insert(rows).execute()
