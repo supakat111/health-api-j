@@ -1,0 +1,220 @@
+"""Health API (Jennifer) — bloodwork extraction service.
+
+Endpoints:
+  GET  /healthz            -> simple liveness check (no auth)
+  GET  /                   -> the upload page (password gate in the page itself)
+  POST /extract            -> receives a PDF/image, returns extracted values (no save yet)
+  POST /save               -> receives confirmed values, stores file + rows
+
+Auth is a simple shared password (APP_PASSWORD) sent as a header. This is the
+same lightweight gate pattern as the warehouse app — enough to keep the upload
+endpoint from being open to the whole internet. It is not multi-user accounts.
+"""
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+
+from app.config import settings
+from app.extract import extract_from_file, _is_pdf
+from app.db import upload_pdf, save_report
+
+
+app = FastAPI(title="Health API J")
+
+ALLOWED_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/webp"}
+
+
+def _check_auth(password: str | None):
+    if not settings.app_password:
+        raise HTTPException(500, "Server missing APP_PASSWORD configuration.")
+    if password != settings.app_password:
+        raise HTTPException(401, "Wrong or missing password.")
+
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+
+@app.post("/extract")
+async def extract(
+    file: UploadFile = File(...),
+    x_app_password: str | None = Header(default=None),
+):
+    _check_auth(x_app_password)
+
+    content_type = file.content_type or ""
+    if content_type not in ALLOWED_TYPES:
+        raise HTTPException(400, f"Unsupported file type: {content_type}. Upload a PDF or image.")
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(400, "Empty file.")
+
+    try:
+        data = extract_from_file(file_bytes, content_type)
+    except ValueError as e:
+        raise HTTPException(422, f"Extraction failed: {e}")
+    except Exception as e:
+        raise HTTPException(500, f"Unexpected extraction error: {e}")
+
+    return JSONResponse(data)
+
+
+@app.post("/save")
+async def save(
+    file: UploadFile = File(...),
+    payload: str = Form(...),
+    x_app_password: str | None = Header(default=None),
+):
+    _check_auth(x_app_password)
+    import json
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "payload is not valid JSON.")
+
+    content_type = file.content_type or "application/pdf"
+    file_bytes = await file.read()
+
+    try:
+        path = upload_pdf(file_bytes, file.filename or "report", content_type)
+    except Exception as e:
+        raise HTTPException(500, f"File upload to storage failed: {e}")
+
+    try:
+        report_id = save_report(
+            report_date=parsed.get("report_date"),
+            lab_name=parsed.get("lab_name"),
+            file_path=path,
+            file_name=file.filename or "report",
+            results=parsed.get("results", []),
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Saving to database failed: {e}")
+
+    return {"status": "saved", "report_id": report_id, "count": len(parsed.get("results", []))}
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return PAGE
+
+
+PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Bloodwork upload</title>
+<style>
+  body { font-family: Georgia, serif; background:#faf7f3; color:#3a2e28; max-width:760px; margin:0 auto; padding:24px 16px; }
+  h1 { font-size:20px; }
+  .card { background:#fffdf9; border:1px solid #efe8e0; border-radius:14px; padding:18px; margin-bottom:16px; }
+  input[type=password], input[type=text] { padding:9px 11px; border:1px solid #e0d8d0; border-radius:9px; font-size:14px; font-family:inherit; }
+  button { padding:11px 18px; border:none; border-radius:11px; background:#5a3a1a; color:#fff; font-family:inherit; font-size:14px; font-weight:700; cursor:pointer; }
+  button.secondary { background:transparent; color:#5a3a1a; border:2px solid #8a6a4a; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid #efe8e0; }
+  td input { width:100%; box-sizing:border-box; padding:5px 7px; border:1px solid #e8e0d6; border-radius:6px; font-size:13px; font-family:inherit; }
+  tr.oor td { background:#fdecea; }
+  tr.review td { background:#fdf6e3; }
+  .flag { font-size:10px; font-weight:700; padding:2px 6px; border-radius:6px; }
+  .flag.oor { background:#f3c7c1; color:#9a3b30; }
+  .flag.review { background:#ece0bf; color:#8a6a1a; }
+  .muted { color:#9a8a7a; font-size:12px; }
+  #status { margin-top:10px; font-size:13px; }
+</style></head><body>
+<h1>Bloodwork upload</h1>
+<div class="card">
+  <div><label>Password <input type="password" id="pw" placeholder="app password"/></label></div>
+  <p class="muted">Choose a bloodwork PDF (or photo), then Extract. Review the values, fix any highlighted ones, then Save.</p>
+  <input type="file" id="file" accept="application/pdf,image/*"/>
+  <button id="extractBtn">Extract</button>
+  <div id="status"></div>
+</div>
+
+<div class="card" id="resultCard" style="display:none">
+  <div style="display:flex; gap:16px; flex-wrap:wrap; margin-bottom:12px">
+    <label>Report date <input type="text" id="reportDate" placeholder="YYYY-MM-DD"/></label>
+    <label>Lab <input type="text" id="labName" placeholder="lab name"/></label>
+  </div>
+  <table id="tbl"><thead><tr>
+    <th>Test</th><th>Value</th><th>Unit</th><th>Ref low</th><th>Ref high</th><th>Flags</th>
+  </tr></thead><tbody></tbody></table>
+  <p style="margin-top:14px"><button id="saveBtn">Save to database</button></p>
+  <div id="saveStatus" class="muted"></div>
+</div>
+
+<script>
+let lastResults = [];
+const $ = s => document.querySelector(s);
+
+$("#extractBtn").onclick = async () => {
+  const pw = $("#pw").value;
+  const f = $("#file").files[0];
+  if (!pw) { $("#status").textContent = "Enter the password first."; return; }
+  if (!f) { $("#status").textContent = "Choose a file first."; return; }
+  $("#status").textContent = "Extracting… (this takes a few seconds)";
+  const fd = new FormData(); fd.append("file", f);
+  try {
+    const res = await fetch("/extract", { method:"POST", headers:{ "x-app-password": pw }, body: fd });
+    if (!res.ok) { $("#status").textContent = "Error: " + (await res.text()); return; }
+    const data = await res.json();
+    lastResults = data.results || [];
+    $("#reportDate").value = data.report_date || "";
+    $("#labName").value = data.lab_name || "";
+    renderTable();
+    $("#resultCard").style.display = "block";
+    $("#status").textContent = "Found " + lastResults.length + " values. Review and save.";
+  } catch (e) { $("#status").textContent = "Request failed: " + e; }
+};
+
+function renderTable() {
+  const tb = $("#tbl tbody"); tb.innerHTML = "";
+  lastResults.forEach((r, i) => {
+    const tr = document.createElement("tr");
+    if (r.out_of_range) tr.className = "oor";
+    else if (r.needs_review) tr.className = "review";
+    tr.innerHTML =
+      `<td><input value="${esc(r.test_name||"")}" data-i="${i}" data-k="test_name"/></td>`+
+      `<td><input value="${esc(r.value_text!=null?r.value_text:(r.value_num!=null?r.value_num:""))}" data-i="${i}" data-k="value_text"/></td>`+
+      `<td><input value="${esc(r.unit||"")}" data-i="${i}" data-k="unit"/></td>`+
+      `<td><input value="${r.ref_low!=null?r.ref_low:""}" data-i="${i}" data-k="ref_low"/></td>`+
+      `<td><input value="${r.ref_high!=null?r.ref_high:""}" data-i="${i}" data-k="ref_high"/></td>`+
+      `<td>${r.out_of_range?'<span class="flag oor">out of range</span>':''}${r.needs_review?' <span class="flag review">review</span>':''}</td>`;
+    tb.appendChild(tr);
+  });
+  tb.querySelectorAll("input").forEach(inp => {
+    inp.oninput = () => {
+      const i = +inp.dataset.i, k = inp.dataset.k;
+      lastResults[i][k] = inp.value;
+    };
+  });
+}
+
+function esc(s){ return String(s).replace(/"/g,"&quot;").replace(/</g,"&lt;"); }
+
+$("#saveBtn").onclick = async () => {
+  const pw = $("#pw").value;
+  const f = $("#file").files[0];
+  // normalize numeric fields back to numbers/null before saving
+  const results = lastResults.map(r => ({
+    ...r,
+    value_num: isFinite(parseFloat(r.value_text)) ? parseFloat(r.value_text) : null,
+    ref_low: r.ref_low===""||r.ref_low==null ? null : parseFloat(r.ref_low),
+    ref_high: r.ref_high===""||r.ref_high==null ? null : parseFloat(r.ref_high),
+  }));
+  const payload = JSON.stringify({
+    report_date: $("#reportDate").value || null,
+    lab_name: $("#labName").value || null,
+    results,
+  });
+  const fd = new FormData(); fd.append("file", f); fd.append("payload", payload);
+  $("#saveStatus").textContent = "Saving…";
+  try {
+    const res = await fetch("/save", { method:"POST", headers:{ "x-app-password": pw }, body: fd });
+    if (!res.ok) { $("#saveStatus").textContent = "Error: " + (await res.text()); return; }
+    const out = await res.json();
+    $("#saveStatus").textContent = "Saved " + out.count + " values (report " + out.report_id + ").";
+  } catch (e) { $("#saveStatus").textContent = "Request failed: " + e; }
+};
+</script>
+</body></html>"""
