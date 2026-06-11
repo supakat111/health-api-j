@@ -15,7 +15,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.config import settings
 from app.extract import extract_from_file, _is_pdf
-from app.db import upload_pdf, save_report
+from app.db import upload_pdf, save_report, fetch_daily_entries, fetch_lab_series
+from app.cycles import load_cycle_starts, cycle_info
 from app.resolve import (
     resolve_results, load_canonical_tests, create_canonical, add_alias,
     suggest_mappings,
@@ -127,6 +128,49 @@ async def add_canonical(
         raise HTTPException(500, f"Saving canonical/alias failed: {e}")
 
     return {"status": "ok", "canonical_id": cid}
+
+
+@app.get("/chartdata")
+def chart_data(x_app_password: str | None = Header(default=None)):
+    """All data the dashboard needs: daily metrics, lab series, and a per-date
+    cycle-phase lookup so the chart can optionally show cycle context."""
+    _check_auth(x_app_password)
+
+    daily = fetch_daily_entries()
+    labs = fetch_lab_series()
+    starts = load_cycle_starts()
+
+    # Build a compact daily-metric series for the numeric fields worth charting.
+    metric_fields = ["pain", "sleepQuality", "stress", "immuneActivation"]
+    daily_series = {f: [] for f in metric_fields}
+    bool_events = {"migraine": [], "bedBound": [], "ivig": [], "vitCDrip": [], "glutathione": []}
+    phase_by_date = {}
+
+    for e in daily:
+        d = e.get("date")
+        if not d:
+            continue
+        phase_by_date[d] = cycle_info(d, starts)
+        for f in metric_fields:
+            v = e.get(f)
+            if isinstance(v, (int, float)):
+                daily_series[f].append({"date": d, "value": v})
+        for f in bool_events:
+            if e.get(f) is True:
+                bool_events[f].append(d)
+
+    # cycle phase for lab dates too
+    for s in labs.values():
+        for p in s["points"]:
+            if p.get("date") and p["date"] not in phase_by_date:
+                phase_by_date[p["date"]] = cycle_info(p["date"], starts)
+
+    return {
+        "daily_series": daily_series,
+        "bool_events": bool_events,
+        "labs": labs,
+        "phase_by_date": phase_by_date,
+    }
 
 
 @app.post("/save")
@@ -391,5 +435,149 @@ $("#saveBtn").onclick = async () => {
     $("#saveStatus").textContent = "Saved " + out.count + " values (report " + out.report_id + ").";
   } catch (e) { $("#saveStatus").textContent = "Request failed: " + e; }
 };
+</script>
+</body></html>"""
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return DASHBOARD
+
+
+DASHBOARD = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Health trends</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/luxon@3.4.4/build/global/luxon.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1.3.1/dist/chartjs-adapter-luxon.umd.min.js"></script>
+<style>
+  body { font-family: Georgia, serif; background:#faf7f3; color:#3a2e28; max-width:920px; margin:0 auto; padding:24px 16px; }
+  h1 { font-size:20px; } h2 { font-size:15px; margin:0 0 10px; }
+  .card { background:#fffdf9; border:1px solid #efe8e0; border-radius:14px; padding:16px; margin-bottom:16px; }
+  input[type=password] { padding:9px 11px; border:1px solid #e0d8d0; border-radius:9px; font-size:14px; font-family:inherit; }
+  button { padding:10px 16px; border:none; border-radius:10px; background:#5a3a1a; color:#fff; font-family:inherit; font-size:14px; font-weight:700; cursor:pointer; }
+  select { padding:8px 10px; border:1px solid #e0d8d0; border-radius:9px; font-size:13px; font-family:inherit; }
+  .muted { color:#9a8a7a; font-size:12px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:640px){ .grid{ grid-template-columns:1fr; } }
+  label.tog { font-size:13px; display:inline-flex; align-items:center; gap:6px; }
+  .chartwrap { position:relative; height:240px; }
+</style></head><body>
+<h1>Health trends</h1>
+<div class="card">
+  <label>Password <input type="password" id="pw" placeholder="app password"/></label>
+  <button id="loadBtn">Load data</button>
+  <label class="tog" style="margin-left:16px"><input type="checkbox" id="cycleTog"/> Show cycle phase</label>
+  <div id="status" class="muted" style="margin-top:8px"></div>
+</div>
+
+<div class="card" id="overlayCard" style="display:none">
+  <h2>Compare two metrics</h2>
+  <div style="margin-bottom:10px">
+    <select id="ovA"></select>
+    <span class="muted">vs</span>
+    <select id="ovB"></select>
+  </div>
+  <div class="chartwrap"><canvas id="overlay"></canvas></div>
+</div>
+
+<div id="charts" class="grid"></div>
+
+<script>
+let DATA = null;
+const $ = s => document.querySelector(s);
+const PHASE_COLORS = { Menstrual:"#fdf0ef", Follicular:"#eef5f9", Ovulatory:"#eef7f1", Luteal:"#f4eff9", Unknown:"transparent" };
+const charts = [];
+
+$("#loadBtn").onclick = load;
+$("#cycleTog").onchange = () => { if (DATA) renderAll(); };
+
+async function load() {
+  const pw = $("#pw").value;
+  if (!pw) { $("#status").textContent = "Enter the password."; return; }
+  $("#status").textContent = "Loading…";
+  try {
+    const res = await fetch("/chartdata", { headers:{ "x-app-password": pw } });
+    if (!res.ok) { $("#status").textContent = "Error: " + (await res.text()); return; }
+    DATA = await res.json();
+    buildSeriesList();
+    renderAll();
+    $("#status").textContent = "Loaded.";
+  } catch(e){ $("#status").textContent = "Failed: " + e; }
+}
+
+// Combine daily metrics + lab series into one named map of {label: [{date,value}]}
+function allSeries() {
+  const out = {};
+  const dn = { pain:"Pain", sleepQuality:"Sleep quality", stress:"Stress", immuneActivation:"Immune activation" };
+  for (const k in DATA.daily_series) if (DATA.daily_series[k].length) out[dn[k]||k] = DATA.daily_series[k];
+  for (const lab in DATA.labs) if (DATA.labs[lab].points.length) out[lab] = DATA.labs[lab].points;
+  return out;
+}
+
+function buildSeriesList() {
+  const s = allSeries();
+  const names = Object.keys(s);
+  const fill = sel => { sel.innerHTML = names.map(n=>`<option>${n}</option>`).join(""); };
+  fill($("#ovA")); fill($("#ovB"));
+  if (names.length>1) $("#ovB").selectedIndex = 1;
+  $("#overlayCard").style.display = names.length ? "block" : "none";
+  $("#ovA").onchange = renderOverlay; $("#ovB").onchange = renderOverlay;
+}
+
+function phaseBands() {
+  if (!$("#cycleTog").checked) return [];
+  const pb = DATA.phase_by_date || {};
+  return Object.entries(pb).map(([date,info]) => ({ date, color: PHASE_COLORS[info.phase]||"transparent" }));
+}
+
+function makeChart(canvas, datasets, withBands) {
+  return new Chart(canvas, {
+    type:"line",
+    data:{ datasets },
+    options:{
+      parsing:false, maintainAspectRatio:false,
+      scales:{ x:{ type:"time", time:{ unit:"day" } } },
+      plugins:{ legend:{ labels:{ font:{ family:"Georgia" } } } }
+    }
+  });
+}
+
+function toXY(points){ return points.map(p=>({x:p.date, y:p.value})); }
+
+function renderAll() {
+  charts.forEach(c=>c.destroy()); charts.length=0;
+  const wrap = $("#charts"); wrap.innerHTML="";
+  const s = allSeries();
+  for (const name in s) {
+    const card = document.createElement("div"); card.className="card";
+    card.innerHTML = `<h2>${name}</h2><div class="chartwrap"><canvas></canvas></div>`;
+    wrap.appendChild(card);
+    const ds = [{ label:name, data:toXY(s[name]), borderColor:"#5a3a1a", backgroundColor:"#5a3a1a", tension:0.2, spanGaps:true }];
+    charts.push(makeChart(card.querySelector("canvas"), ds, true));
+  }
+  renderOverlay();
+}
+
+let overlayChart = null;
+function renderOverlay() {
+  if (!DATA) return;
+  const s = allSeries();
+  const a = $("#ovA").value, b = $("#ovB").value;
+  if (overlayChart) overlayChart.destroy();
+  const ds = [
+    { label:a, data:toXY(s[a]||[]), borderColor:"#5a3a1a", backgroundColor:"#5a3a1a", yAxisID:"y", tension:0.2, spanGaps:true },
+    { label:b, data:toXY(s[b]||[]), borderColor:"#5b8fa8", backgroundColor:"#5b8fa8", yAxisID:"y1", tension:0.2, spanGaps:true },
+  ];
+  overlayChart = new Chart($("#overlay"), {
+    type:"line", data:{ datasets:ds },
+    options:{ parsing:false, maintainAspectRatio:false,
+      scales:{ x:{type:"time", time:{unit:"day"}},
+        y:{ position:"left", title:{display:true,text:a} },
+        y1:{ position:"right", title:{display:true,text:b}, grid:{drawOnChartArea:false} } },
+      plugins:{ legend:{ labels:{ font:{ family:"Georgia" } } } } }
+  });
+}
 </script>
 </body></html>"""

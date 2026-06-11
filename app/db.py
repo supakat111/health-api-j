@@ -61,3 +61,60 @@ def save_report(report_date, lab_name, file_path, file_name, results: list) -> s
         sb.table("lab_results").insert(rows).execute()
 
     return report_id
+
+
+# ── Reads for the charts / trends dashboard ──────────────────────────────────
+
+def fetch_daily_entries() -> list:
+    """All tracker daily entries from the tracker's `entries` table, oldest first.
+    Each row's `data` is the JSON the tracker saved (pain, sleep, etc.) and the
+    key/id encodes the date."""
+    sb = _client()
+    rows = sb.table("entries").select("id, data").execute().data or []
+    out = []
+    for r in rows:
+        d = r.get("data") or {}
+        # the tracker stores the date inside data.date; fall back to the id
+        date = d.get("date") or r.get("id")
+        if date:
+            d = {**d, "date": date}
+            out.append(d)
+    out.sort(key=lambda e: e.get("date", ""))
+    return out
+
+
+def fetch_lab_series() -> dict:
+    """Lab results grouped by canonical test (falling back to raw name when a
+    value was never mapped). Returns:
+       { test_label: {"unit": str|None, "ref_low": .., "ref_high": ..,
+                      "points": [{"date":.., "value":..}, ...]} }
+    """
+    sb = _client()
+    results = sb.table("lab_results").select(
+        "report_date, test_name, raw_test_name, value_num, unit, ref_low, ref_high, canonical_id"
+    ).execute().data or []
+
+    canon = {c["id"]: c for c in (sb.table("canonical_tests").select("*").execute().data or [])}
+
+    series = {}
+    for r in results:
+        if r.get("value_num") is None:
+            continue  # non-numeric values can't be charted
+        cid = r.get("canonical_id")
+        if cid and cid in canon:
+            label = canon[cid]["display_name"]
+            unit = canon[cid].get("canonical_unit") or r.get("unit")
+            ref_low = canon[cid].get("ref_low")
+            ref_high = canon[cid].get("ref_high")
+        else:
+            label = r.get("test_name") or r.get("raw_test_name") or "Unknown"
+            unit = r.get("unit")
+            ref_low = r.get("ref_low")
+            ref_high = r.get("ref_high")
+
+        s = series.setdefault(label, {"unit": unit, "ref_low": ref_low, "ref_high": ref_high, "points": []})
+        s["points"].append({"date": r.get("report_date"), "value": r["value_num"]})
+
+    for s in series.values():
+        s["points"].sort(key=lambda p: p.get("date") or "")
+    return series
