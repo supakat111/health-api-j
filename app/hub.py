@@ -63,6 +63,7 @@ HUB_PAGE = r"""<!doctype html>
 <nav id="nav" style="display:none">
   <button data-tab="surv" class="active">⚠ Needs attention</button>
   <button data-tab="charts">📈 Charts</button>
+  <button data-tab="analysis">🔍 Analysis</button>
   <button data-tab="upload">⬆ Upload labs</button>
 </nav>
 
@@ -84,8 +85,24 @@ HUB_PAGE = r"""<!doctype html>
   <!-- CHARTS -->
   <section data-panel="charts" style="display:none">
     <div class="card">
-      <label class="tog"><input type="checkbox" id="cycleTog"/> Show cycle phase</label>
-      <span class="muted" id="chartMsg" style="margin-left:12px"></span>
+      <div style="display:flex; flex-wrap:wrap; gap:14px; align-items:center">
+        <label class="tog"><input type="checkbox" id="cycleTog"/> Show cycle phase</label>
+        <span style="border-left:1px solid #e0d8d0; height:20px"></span>
+        <label class="tog">Range
+          <select id="rangePreset">
+            <option value="all">All time</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="180">Last 6 months</option>
+            <option value="365">Last year</option>
+            <option value="custom">Custom…</option>
+          </select>
+        </label>
+        <span id="customRange" style="display:none">
+          <input type="date" id="rangeFrom"/> <span class="muted">to</span> <input type="date" id="rangeTo"/>
+        </span>
+        <span class="muted" id="chartMsg"></span>
+      </div>
     </div>
     <div class="card" id="overlayCard" style="display:none">
       <h2>Compare two metrics</h2>
@@ -93,6 +110,21 @@ HUB_PAGE = r"""<!doctype html>
       <div class="chartwrap"><canvas id="overlay"></canvas></div>
     </div>
     <div id="charts" class="grid"></div>
+  </section>
+
+  <!-- ANALYSIS -->
+  <section data-panel="analysis" style="display:none">
+    <div class="card">
+      <h2>AI pattern analysis</h2>
+      <div class="muted" style="margin-bottom:10px">
+        This looks across the lab results and daily tracker data and surfaces possible patterns.
+        It is <b>information to review with a doctor, not medical advice or a diagnosis</b>.
+        Patterns from limited data can be coincidental — treat them as questions to ask, not conclusions.
+      </div>
+      <button class="act" id="analyzeBtn">Analyze my data</button>
+      <span class="muted" id="analysisMsg" style="margin-left:10px"></span>
+    </div>
+    <div id="analysisOut" class="grid" style="grid-template-columns:1fr"></div>
   </section>
 
   <!-- UPLOAD -->
@@ -147,6 +179,46 @@ document.querySelectorAll("#nav button").forEach(b => b.onclick = () => {
   if (tab==="charts" && !chartsLoaded) loadCharts();
 });
 
+// ================= ANALYSIS =================
+$("#analyzeBtn").onclick = async () => {
+  $("#analysisMsg").textContent = "Analyzing… (this takes a few seconds)";
+  $("#analysisOut").innerHTML = "";
+  try {
+    const res = await fetch("/analyze", { headers: hdr() });
+    if (!res.ok) { $("#analysisMsg").textContent = "Error: " + (await res.text()); return; }
+    const data = await res.json();
+    $("#analysisMsg").textContent = "";
+    renderAnalysis(data);
+  } catch(e){ $("#analysisMsg").textContent = "Failed: " + e; }
+};
+
+function renderAnalysis(data){
+  const out = $("#analysisOut");
+  if (data.note) { out.innerHTML = `<div class="card muted">${esc(data.note)}</div>`; }
+  const framings = data.framings || {};
+  const titles = {
+    doctor: "① Patterns for your doctor",
+    context: "② Patterns + plain-language context",
+    interpretation: "③ Fuller interpretation"
+  };
+  const subtitles = {
+    doctor: "Observations only, worded to bring to an appointment.",
+    context: "Same observations, with brief lay explanation of terms.",
+    interpretation: "Goes further toward what patterns might suggest — highest risk of over-reading."
+  };
+  ["doctor","context","interpretation"].forEach(key=>{
+    if(!framings[key]) return;
+    const card=document.createElement("div"); card.className="card";
+    card.innerHTML = `<h2>${titles[key]}</h2><div class="muted" style="margin-bottom:10px">${subtitles[key]}</div>`+
+      `<div style="white-space:pre-wrap; font-size:14px; line-height:1.6">${esc(framings[key])}</div>`+
+      `<div style="margin-top:12px"><button class="sec pickBtn" data-k="${key}">This framing is best</button></div>`;
+    out.appendChild(card);
+  });
+  out.querySelectorAll(".pickBtn").forEach(b=>b.onclick=()=>{
+    $("#analysisMsg").textContent = "Noted — '"+titles[b.dataset.k]+"' preferred. Tell Claude to make it the default.";
+  });
+}
+
 // ================= SURVEILLANCE =================
 function loadSurv(data){
   const c = data.counts || {};
@@ -179,6 +251,29 @@ function statusPill(s){
 let DATA=null, chartsLoaded=false; const charts=[]; let overlayChart=null;
 const PHASE_COLORS={Menstrual:"#fdf0ef",Follicular:"#eef5f9",Ovulatory:"#eef7f1",Luteal:"#f4eff9",Unknown:"transparent"};
 $("#cycleTog").onchange=()=>{ if(DATA) renderAll(); };
+$("#rangePreset").onchange=()=>{
+  $("#customRange").style.display = $("#rangePreset").value==="custom" ? "inline":"none";
+  if(DATA) renderAll();
+};
+$("#rangeFrom").onchange=()=>{ if(DATA) renderAll(); };
+$("#rangeTo").onchange=()=>{ if(DATA) renderAll(); };
+
+function activeRange(){
+  const preset=$("#rangePreset").value;
+  if(preset==="all") return {from:null,to:null};
+  if(preset==="custom") return {from:$("#rangeFrom").value||null, to:$("#rangeTo").value||null};
+  const days=parseInt(preset,10);
+  const to=new Date();
+  const from=new Date(Date.now()-days*864e5);
+  return {from:from.toISOString().slice(0,10), to:to.toISOString().slice(0,10)};
+}
+function inRange(date,r){
+  if(!date) return false;
+  if(r.from && date<r.from) return false;
+  if(r.to && date>r.to) return false;
+  return true;
+}
+function filterPts(points){ const r=activeRange(); return points.filter(p=>inRange(p.date,r)); }
 
 async function loadCharts(){
   $("#chartMsg").textContent="Loading…";
@@ -188,8 +283,8 @@ async function loadCharts(){
 }
 function allSeries(){
   const out={}; const dn={pain:"Pain",sleepQuality:"Sleep quality",stress:"Stress",immuneActivation:"Immune activation"};
-  for(const k in DATA.daily_series) if(DATA.daily_series[k].length) out[dn[k]||k]=DATA.daily_series[k];
-  for(const lab in DATA.labs) if(DATA.labs[lab].points.length) out[lab]=DATA.labs[lab].points;
+  for(const k in DATA.daily_series) if(DATA.daily_series[k].length) out[dn[k]||k]=filterPts(DATA.daily_series[k]);
+  for(const lab in DATA.labs) if(DATA.labs[lab].points.length) out[lab]=filterPts(DATA.labs[lab].points);
   return out;
 }
 function buildSeriesList(){

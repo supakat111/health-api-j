@@ -18,6 +18,7 @@ from app.extract import extract_from_file, _is_pdf
 from app.db import upload_pdf, save_report, fetch_daily_entries, fetch_lab_series, lab_surveillance
 from app.cycles import load_cycle_starts, cycle_info
 from app.hub import HUB_PAGE
+from app.analyze import analyze as run_analysis
 from app.resolve import (
     resolve_results, load_canonical_tests, create_canonical, add_alias,
     suggest_mappings,
@@ -140,6 +141,12 @@ async def add_canonical(
 def surveillance(x_app_password: str | None = Header(default=None)):
     _check_auth(x_app_password)
     return lab_surveillance(borderline_pct=0.10)
+
+
+@app.get("/analyze")
+def analyze_endpoint(x_app_password: str | None = Header(default=None)):
+    _check_auth(x_app_password)
+    return run_analysis()
 
 
 @app.get("/chartdata")
