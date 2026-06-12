@@ -19,6 +19,7 @@ from app.db import upload_pdf, save_report, fetch_daily_entries, fetch_lab_serie
 from app.cycles import load_cycle_starts, cycle_info
 from app.hub import HUB_PAGE
 from app.analyze import analyze as run_analysis
+from app.importer import preview as import_preview, commit as import_commit
 from app.resolve import (
     resolve_results, load_canonical_tests, create_canonical, add_alias,
     suggest_mappings,
@@ -147,6 +148,32 @@ def surveillance(x_app_password: str | None = Header(default=None)):
 def analyze_endpoint(x_app_password: str | None = Header(default=None)):
     _check_auth(x_app_password)
     return run_analysis()
+
+
+@app.post("/import/preview")
+async def import_preview_endpoint(
+    file: UploadFile = File(...),
+    x_app_password: str | None = Header(default=None),
+):
+    _check_auth(x_app_password)
+    data = await file.read()
+    try:
+        return import_preview(data)
+    except Exception as e:
+        raise HTTPException(422, f"Could not read file: {e}")
+
+
+@app.post("/import/commit")
+async def import_commit_endpoint(
+    file: UploadFile = File(...),
+    x_app_password: str | None = Header(default=None),
+):
+    _check_auth(x_app_password)
+    data = await file.read()
+    try:
+        return import_commit(data)
+    except Exception as e:
+        raise HTTPException(500, f"Import failed: {e}")
 
 
 @app.get("/chartdata")

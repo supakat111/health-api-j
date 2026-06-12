@@ -65,6 +65,7 @@ HUB_PAGE = r"""<!doctype html>
   <button data-tab="charts">📈 Charts</button>
   <button data-tab="analysis">🔍 Analysis</button>
   <button data-tab="upload">⬆ Upload labs</button>
+  <button data-tab="import">📥 Import old data</button>
 </nav>
 
 <div class="wrap" id="main" style="display:none">
@@ -153,6 +154,27 @@ HUB_PAGE = r"""<!doctype html>
     </div>
   </section>
 
+  <!-- IMPORT -->
+  <section data-panel="import" style="display:none">
+    <div class="card">
+      <h2>Import old tracker data</h2>
+      <div class="muted" style="margin-bottom:10px">
+        Upload the old Tally tracker spreadsheet (.xlsx). It maps pain, sleep, stress,
+        immune activation, exercise and notes into daily entries. Dates that already
+        exist are skipped — nothing gets overwritten. You'll see a preview before anything is saved.
+      </div>
+      <input type="file" id="importFile" accept=".xlsx"/>
+      <button class="act" id="importPreviewBtn">Preview</button>
+      <div id="importMsg" class="muted" style="margin-top:8px"></div>
+    </div>
+    <div class="card" id="importPreviewCard" style="display:none">
+      <div id="importSummary" style="margin-bottom:12px"></div>
+      <table id="importTbl"><thead><tr><th>Date</th><th>Pain</th><th>Sleep</th><th>Stress</th><th>Immune</th><th>Notes</th></tr></thead><tbody></tbody></table>
+      <p style="margin-top:14px"><button class="act" id="importCommitBtn">Import these entries</button></p>
+      <div id="importCommitMsg" class="muted"></div>
+    </div>
+  </section>
+
 </div>
 
 <script>
@@ -218,6 +240,46 @@ function renderAnalysis(data){
     $("#analysisMsg").textContent = "Noted — '"+titles[b.dataset.k]+"' preferred. Tell Claude to make it the default.";
   });
 }
+
+// ================= IMPORT =================
+$("#importPreviewBtn").onclick = async () => {
+  const f = $("#importFile").files[0];
+  if(!f){ $("#importMsg").textContent="Choose the .xlsx file first."; return; }
+  $("#importMsg").textContent="Reading…";
+  const fd=new FormData(); fd.append("file",f);
+  const res=await fetch("/import/preview",{method:"POST",headers:hdr(),body:fd});
+  if(!res.ok){ $("#importMsg").textContent="Error: "+(await res.text()); return; }
+  const p=await res.json();
+  $("#importMsg").textContent="";
+  $("#importSummary").innerHTML =
+    `<b>${p.total}</b> entries found (${p.date_range[0]} → ${p.date_range[1]}). `+
+    `<b>${p.new_count}</b> new to import, <b>${p.skip_count}</b> already exist (will skip).`;
+  const tb=$("#importTbl tbody"); tb.innerHTML="";
+  (p.sample||[]).forEach(e=>{
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td>${e.date}</td><td>${e.pain??""}</td><td>${e.sleepQuality??""}</td>`+
+      `<td>${e.stress??""}</td><td>${e.immuneActivation??""}</td>`+
+      `<td class="muted">${esc((e.notes||"").slice(0,60))}</td>`;
+    tb.appendChild(tr);
+  });
+  if((p.sample||[]).length) {
+    const note=document.createElement("tr");
+    note.innerHTML=`<td colspan="6" class="muted">…showing first ${p.sample.length} of ${p.new_count} new entries</td>`;
+    tb.appendChild(note);
+  }
+  $("#importPreviewCard").style.display = p.new_count ? "block":"none";
+  if(!p.new_count) $("#importMsg").textContent="Nothing new to import — all those dates already have entries.";
+};
+
+$("#importCommitBtn").onclick = async () => {
+  const f = $("#importFile").files[0];
+  $("#importCommitMsg").textContent="Importing…";
+  const fd=new FormData(); fd.append("file",f);
+  const res=await fetch("/import/commit",{method:"POST",headers:hdr(),body:fd});
+  if(!res.ok){ $("#importCommitMsg").textContent="Error: "+(await res.text()); return; }
+  const r=await res.json();
+  $("#importCommitMsg").textContent=`Imported ${r.written} entries (skipped ${r.skipped} existing). Check the Charts tab — pick "All time" to see them.`;
+};
 
 // ================= SURVEILLANCE =================
 function loadSurv(data){
